@@ -159,7 +159,34 @@ app.get('/api/products', async (req, res) => {
         });
     }
 });
+// =========================================================================
+// ROUTE MỞ: LẤY DANH SÁCH DANH MỤC
+// =========================================================================
+app.get('/api/categories', async (req, res) => {
+    try {
+        const [rows] = await dbPool.execute(
+            `
+            SELECT
+                category_id,
+                category_name,
+                created_at
+            FROM categories
+            ORDER BY created_at DESC
+            `
+        );
 
+        return res.json({
+            message: "Lấy danh sách danh mục thành công!",
+            categories: rows
+        });
+
+    } catch (error) {
+        console.error("Lỗi lấy danh sách categories:", error);
+        return res.status(500).json({
+            error: "Không thể lấy danh sách danh mục!"
+        });
+    }
+});
 // =========================================================================
 // ROUTE BẢO MẬT: ADMIN XIN PRE-SIGNED URL ĐỂ UPLOAD ẢNH LÊN S3
 // =========================================================================
@@ -500,7 +527,143 @@ app.delete('/api/products/:productId', authMiddleware, adminMiddleware, async (r
         if (connection) connection.release();
     }
 });
+// =========================================================================
+// ROUTE BẢO MẬT: CHỈ ADMIN MỚI ĐƯỢC TẠO DANH MỤC
+// =========================================================================    
+app.post('/api/categories', authMiddleware, adminMiddleware, async (req, res) => {
+    const { categoryName } = req.body || {};
 
+    if (!categoryName || !categoryName.trim()) {
+        return res.status(400).json({
+            error: "Tên danh mục không được để trống!"
+        });
+    }
+
+    try {
+        const [result] = await dbPool.execute(
+            `
+            INSERT INTO categories (category_name)
+            VALUES (?)
+            `,
+            [categoryName.trim()]
+        );
+
+        return res.status(201).json({
+            message: "Admin đã tạo danh mục thành công!",
+            categoryId: result.insertId
+        });
+
+    } catch (error) {
+        console.error("Lỗi tạo category:", error);
+
+        if (error.code === "ER_DUP_ENTRY") {
+            return res.status(400).json({
+                error: "Danh mục này đã tồn tại!"
+            });
+        }
+
+        return res.status(500).json({
+            error: "Không thể tạo danh mục!"
+        });
+    }
+});
+// =========================================================================
+// ROUTE BẢO MẬT: CHỈ ADMIN MỚI ĐƯỢC SỬA DANH MỤC
+// =========================================================================
+app.put('/api/categories/:categoryId', authMiddleware, adminMiddleware, async (req, res) => {
+    const { categoryId } = req.params;
+    const { categoryName } = req.body || {};
+
+    if (!categoryName || !categoryName.trim()) {
+        return res.status(400).json({
+            error: "Tên danh mục không được để trống!"
+        });
+    }
+
+    try {
+        const [rows] = await dbPool.execute(
+            `
+            SELECT category_id
+            FROM categories
+            WHERE category_id = ?
+            `,
+            [categoryId]
+        );
+
+        if (rows.length === 0) {
+            return res.status(404).json({
+                error: "Không tìm thấy danh mục cần sửa!"
+            });
+        }
+
+        await dbPool.execute(
+            `
+            UPDATE categories
+            SET category_name = ?
+            WHERE category_id = ?
+            `,
+            [categoryName.trim(), categoryId]
+        );
+
+        return res.json({
+            message: "Admin đã cập nhật danh mục thành công!"
+        });
+
+    } catch (error) {
+        console.error("Lỗi sửa category:", error);
+
+        if (error.code === "ER_DUP_ENTRY") {
+            return res.status(400).json({
+                error: "Tên danh mục này đã tồn tại!"
+            });
+        }
+
+        return res.status(500).json({
+            error: "Không thể sửa danh mục!"
+        });
+    }
+});
+// =========================================================================
+// ROUTE BẢO MẬT: CHỈ ADMIN MỚI ĐƯỢC XÓA DANH MỤC
+// =========================================================================    
+app.delete('/api/categories/:categoryId', authMiddleware, adminMiddleware, async (req, res) => {
+    const { categoryId } = req.params;
+
+    try {
+        const [rows] = await dbPool.execute(
+            `
+            SELECT category_id, category_name
+            FROM categories
+            WHERE category_id = ?
+            `,
+            [categoryId]
+        );
+
+        if (rows.length === 0) {
+            return res.status(404).json({
+                error: "Không tìm thấy danh mục cần xóa!"
+            });
+        }
+
+        await dbPool.execute(
+            `
+            DELETE FROM categories
+            WHERE category_id = ?
+            `,
+            [categoryId]
+        );
+
+        return res.json({
+            message: "Admin đã xóa danh mục thành công! Các sản phẩm thuộc danh mục này sẽ chuyển về Chưa phân loại."
+        });
+
+    } catch (error) {
+        console.error("Lỗi xóa category:", error);
+        return res.status(500).json({
+            error: "Không thể xóa danh mục!"
+        });
+    }
+});
 // Khởi chạy Product Service ở cổng 3001
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
