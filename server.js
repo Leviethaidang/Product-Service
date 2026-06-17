@@ -276,5 +276,5 @@ app.post('/api/products', authMiddleware, adminMiddleware, async (req, res) => {
 const PORT = process.env.PORT || 3001;
 
 app.listen(PORT, () => {
-    console.log(`Product Service running on port ${PORT} 🚀`);
+    console.log(`Product Service running on port ${PORT}`);
 });
