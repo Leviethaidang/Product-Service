@@ -190,6 +190,57 @@ app.get('/api/categories', async (req, res) => {
     }
 });
 // =========================================================================
+// ROUTE MỞ: LẤY CHI TIẾT SẢN PHẨM
+// =========================================================================
+app.get('/api/products/:productId', async (req, res) => {
+    const { productId } = req.params;
+
+    try {
+        const [rows] = await dbPool.execute(
+            `
+            SELECT 
+                p.product_id,
+                p.product_name,
+                p.description,
+                p.category_id,
+                p.price,
+                p.stock_quantity,
+                p.sold_quantity,
+                p.image_key,
+                p.created_at,
+                p.updated_at,
+                c.category_name
+            FROM products p
+            LEFT JOIN categories c ON p.category_id = c.category_id
+            WHERE p.product_id = ?
+            `,
+            [productId]
+        );
+
+        if (rows.length === 0) {
+            return res.status(404).json({
+                error: "Không tìm thấy sản phẩm!"
+            });
+        }
+
+        const product = rows[0];
+
+        return res.json({
+            message: "Lấy chi tiết sản phẩm thành công!",
+            product: {
+                ...product,
+                imageUrl: buildImageUrl(product.image_key)
+            }
+        });
+
+    } catch (error) {
+        console.error("Lỗi lấy chi tiết sản phẩm:", error);
+        return res.status(500).json({
+            error: "Không thể lấy chi tiết sản phẩm!"
+        });
+    }
+});
+// =========================================================================
 // ROUTE BẢO MẬT: ADMIN XIN PRE-SIGNED URL ĐỂ UPLOAD ẢNH LÊN S3
 // =========================================================================
 app.post('/api/products/upload-url', authMiddleware, adminMiddleware, async (req, res) => {
