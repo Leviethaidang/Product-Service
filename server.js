@@ -130,9 +130,11 @@ app.get('/api/products', async (req, res) => {
             SELECT 
                 p.product_id,
                 p.product_name,
-                p.category_id,
+                p.category_id,  
+                p.description,
                 p.price,
                 p.stock_quantity,
+                p.sold_quantity,
                 p.image_key,
                 p.created_at,
                 p.updated_at,
@@ -241,6 +243,7 @@ app.post('/api/products/upload-url', authMiddleware, adminMiddleware, async (req
 app.post('/api/products', authMiddleware, adminMiddleware, async (req, res) => {
     const {
         productName,
+        description,
         categoryId,
         price,
         stockQuantity,
@@ -276,15 +279,17 @@ app.post('/api/products', authMiddleware, adminMiddleware, async (req, res) => {
             `
             INSERT INTO products (
                 product_name,
+                description,
                 category_id,
                 price,
                 stock_quantity,
                 image_key
             )
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?)
             `,
             [
                 productName.trim(),
+                description ? description.trim() : null,
                 categoryId || null,
                 price,
                 stockQuantity,
@@ -320,9 +325,11 @@ app.put('/api/products/:productId', authMiddleware, adminMiddleware, async (req,
 
     const {
         productName,
+        description,
         categoryId,
         price,
         stockQuantity,
+        soldQuantity,
         imageKey
     } = req.body || {};
 
@@ -336,9 +343,11 @@ app.put('/api/products/:productId', authMiddleware, adminMiddleware, async (req,
             SELECT
                 product_id,
                 product_name,
+                description,
                 category_id,
                 price,
                 stock_quantity,
+                sold_quantity,
                 image_key
             FROM products
             WHERE product_id = ?
@@ -357,6 +366,11 @@ app.put('/api/products/:productId', authMiddleware, adminMiddleware, async (req,
         const nextProductName =
             productName !== undefined ? productName.trim() : currentProduct.product_name;
 
+        const nextDescription =
+            description !== undefined
+                ? (description ? description.trim() : null)
+                : currentProduct.description;
+
         const nextCategoryId =
             categoryId !== undefined && categoryId !== null && categoryId !== ""
                 ? Number(categoryId)
@@ -367,7 +381,10 @@ app.put('/api/products/:productId', authMiddleware, adminMiddleware, async (req,
 
         const nextStockQuantity =
             stockQuantity !== undefined ? Number(stockQuantity) : Number(currentProduct.stock_quantity);
-
+        
+        const nextSoldQuantity =
+            soldQuantity !== undefined ? Number(soldQuantity) : Number(currentProduct.sold_quantity);
+        
         const nextImageKey =
             imageKey !== undefined ? imageKey : currentProduct.image_key;
 
@@ -389,6 +406,12 @@ app.put('/api/products/:productId', authMiddleware, adminMiddleware, async (req,
             });
         }
 
+        if (Number.isNaN(nextSoldQuantity) || nextSoldQuantity < 0) {
+            return res.status(400).json({
+                error: "Số lượng đã bán không được nhỏ hơn 0!"
+            });
+        }
+
         if (nextImageKey && !nextImageKey.startsWith("products/")) {
             return res.status(400).json({
                 error: "imageKey không hợp lệ!"
@@ -400,17 +423,21 @@ app.put('/api/products/:productId', authMiddleware, adminMiddleware, async (req,
             UPDATE products
             SET
                 product_name = ?,
+                description = ?,
                 category_id = ?,
                 price = ?,
                 stock_quantity = ?,
+                sold_quantity = ?,
                 image_key = ?
             WHERE product_id = ?
             `,
             [
                 nextProductName,
+                nextDescription || null,
                 nextCategoryId,
                 nextPrice,
                 nextStockQuantity,
+                nextSoldQuantity,
                 nextImageKey || null,
                 productId
             ]
@@ -430,9 +457,11 @@ app.put('/api/products/:productId', authMiddleware, adminMiddleware, async (req,
             SELECT
                 p.product_id,
                 p.product_name,
+                p.description,
                 p.category_id,
                 p.price,
                 p.stock_quantity,
+                p.sold_quantity,
                 p.image_key,
                 p.created_at,
                 p.updated_at,
