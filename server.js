@@ -77,6 +77,211 @@ async function deleteImageFromS3(imageKey) {
         console.error("Lỗi xóa ảnh khỏi S3:", error);
     }
 }
+
+function isValidImageKey(imageKey) {
+    return !imageKey || (
+        typeof imageKey === "string" &&
+        imageKey.startsWith("products/")
+    );
+}
+
+function normalizeSubImageKeys(subImageKeys) {
+    if (subImageKeys === undefined || subImageKeys === null) {
+        return [];
+    }
+
+    if (!Array.isArray(subImageKeys)) {
+        throw new Error("subImageKeys phải là một mảng!");
+    }
+
+    const cleanKeys = [];
+
+    for (const key of subImageKeys) {
+        if (!key) continue;
+
+        if (!isValidImageKey(key)) {
+            throw new Error("subImageKeys chứa imageKey không hợp lệ!");
+        }
+
+        if (!cleanKeys.includes(key)) {
+            cleanKeys.push(key);
+        }
+    }
+
+    return cleanKeys;
+}
+
+function normalizeVariants(variants) {
+    if (!Array.isArray(variants) || variants.length === 0) {
+        throw new Error("Vui lòng nhập ít nhất một biến thể sản phẩm!");
+    }
+
+    const normalized = [];
+    const duplicateMap = new Set();
+
+    for (const variant of variants) {
+        const sizeId = Number(variant.sizeId);
+        const colorId = Number(variant.colorId);
+        const stockQuantity = Number(variant.stockQuantity);
+        const soldQuantity =
+            variant.soldQuantity !== undefined && variant.soldQuantity !== null
+                ? Number(variant.soldQuantity)
+                : 0;
+
+        if (!Number.isInteger(sizeId) || sizeId <= 0) {
+            throw new Error("sizeId của biến thể không hợp lệ!");
+        }
+
+        if (!Number.isInteger(colorId) || colorId <= 0) {
+            throw new Error("colorId của biến thể không hợp lệ!");
+        }
+
+        if (!Number.isInteger(stockQuantity) || stockQuantity < 0) {
+            throw new Error("stockQuantity của biến thể không hợp lệ!");
+        }
+
+        if (!Number.isInteger(soldQuantity) || soldQuantity < 0) {
+            throw new Error("soldQuantity của biến thể không hợp lệ!");
+        }
+
+        const duplicateKey = `${sizeId}:${colorId}`;
+
+        if (duplicateMap.has(duplicateKey)) {
+            throw new Error("Không được tạo trùng biến thể cùng size và màu!");
+        }
+
+        duplicateMap.add(duplicateKey);
+
+        normalized.push({
+            sizeId,
+            colorId,
+            stockQuantity,
+            soldQuantity
+        });
+    }
+
+    return normalized;
+}
+
+async function syncProductTotals(connection, productId) {
+    const [rows] = await connection.execute(
+        `
+        SELECT
+            COALESCE(SUM(stock_quantity), 0) AS total_stock_quantity,
+            COALESCE(SUM(sold_quantity), 0) AS total_sold_quantity
+        FROM product_variants
+        WHERE product_id = ?
+          AND is_active = 1
+        `,
+        [productId]
+    );
+
+    const totals = rows[0];
+
+    await connection.execute(
+        `
+        UPDATE products
+        SET
+            stock_quantity = ?,
+            sold_quantity = ?
+        WHERE product_id = ?
+        `,
+        [
+            totals.total_stock_quantity || 0,
+            totals.total_sold_quantity || 0,
+            productId
+        ]
+    );
+}
+
+async function getProductDetail(productId) {
+    const [productRows] = await dbPool.execute(
+        `
+        SELECT
+            p.product_id,
+            p.product_name,
+            p.description,
+            p.category_id,
+            p.price,
+            COALESCE(totals.total_stock_quantity, p.stock_quantity, 0) AS stock_quantity,
+            COALESCE(totals.total_sold_quantity, p.sold_quantity, 0) AS sold_quantity,
+            p.image_key,
+            p.created_at,
+            p.updated_at,
+            c.category_name
+        FROM products p
+        LEFT JOIN categories c ON p.category_id = c.category_id
+        LEFT JOIN (
+            SELECT
+                product_id,
+                COALESCE(SUM(stock_quantity), 0) AS total_stock_quantity,
+                COALESCE(SUM(sold_quantity), 0) AS total_sold_quantity
+            FROM product_variants
+            WHERE is_active = 1
+            GROUP BY product_id
+        ) totals ON totals.product_id = p.product_id
+        WHERE p.product_id = ?
+        `,
+        [productId]
+    );
+
+    if (productRows.length === 0) {
+        return null;
+    }
+
+    const product = productRows[0];
+
+    const [imageRows] = await dbPool.execute(
+        `
+        SELECT
+            image_id,
+            product_id,
+            image_key,
+            sort_order,
+            created_at
+        FROM product_images
+        WHERE product_id = ?
+        ORDER BY sort_order ASC, image_id ASC
+        `,
+        [productId]
+    );
+
+    const [variantRows] = await dbPool.execute(
+        `
+        SELECT
+            pv.variant_id,
+            pv.product_id,
+            pv.size_id,
+            s.size_name,
+            pv.color_id,
+            c.color_name,
+            c.color_code,
+            pv.stock_quantity,
+            pv.sold_quantity,
+            pv.is_active,
+            pv.created_at,
+            pv.updated_at
+        FROM product_variants pv
+        JOIN sizes s ON pv.size_id = s.size_id
+        JOIN colors c ON pv.color_id = c.color_id
+        WHERE pv.product_id = ?
+          AND pv.is_active = 1
+        ORDER BY s.display_order ASC, c.display_order ASC, pv.variant_id ASC
+        `,
+        [productId]
+    );
+
+    return {
+        ...product,
+        imageUrl: buildImageUrl(product.image_key),
+        images: imageRows.map(image => ({
+            ...image,
+            imageUrl: buildImageUrl(image.image_key)
+        })),
+        variants: variantRows
+    };
+}
+
 // 6. MIDDLEWARE XÁC THỰC
 async function authMiddleware(req, res, next) {
     const authHeader = req.headers.authorization;
@@ -133,14 +338,23 @@ app.get('/api/products', async (req, res) => {
                 p.category_id,  
                 p.description,
                 p.price,
-                p.stock_quantity,
-                p.sold_quantity,
+                COALESCE(totals.total_stock_quantity, p.stock_quantity, 0) AS stock_quantity,
+                COALESCE(totals.total_sold_quantity, p.sold_quantity, 0) AS sold_quantity,
                 p.image_key,
                 p.created_at,
                 p.updated_at,
                 c.category_name
             FROM products p
             LEFT JOIN categories c ON p.category_id = c.category_id
+            LEFT JOIN (
+                SELECT
+                    product_id,
+                    COALESCE(SUM(stock_quantity), 0) AS total_stock_quantity,
+                    COALESCE(SUM(sold_quantity), 0) AS total_sold_quantity
+                FROM product_variants
+                WHERE is_active = 1
+                GROUP BY product_id
+            ) totals ON totals.product_id = p.product_id
             ORDER BY p.created_at DESC
         `);
 
@@ -161,6 +375,64 @@ app.get('/api/products', async (req, res) => {
         });
     }
 });
+// =========================================================================
+// ROUTE MỞ: LẤY DANH SÁCH SIZE VÀ COLOR
+// =========================================================================
+app.get('/api/sizes', async (req, res) => {
+    try {
+        const [rows] = await dbPool.execute(
+            `
+            SELECT
+                size_id,
+                size_name,
+                display_order,
+                created_at
+            FROM sizes
+            ORDER BY display_order ASC, size_id ASC
+            `
+        );
+
+        return res.json({
+            message: "Lấy danh sách size thành công!",
+            sizes: rows
+        });
+
+    } catch (error) {
+        console.error("Lỗi lấy danh sách sizes:", error);
+        return res.status(500).json({
+            error: "Không thể lấy danh sách size!"
+        });
+    }
+});
+
+app.get('/api/colors', async (req, res) => {
+    try {
+        const [rows] = await dbPool.execute(
+            `
+            SELECT
+                color_id,
+                color_name,
+                color_code,
+                display_order,
+                created_at
+            FROM colors
+            ORDER BY display_order ASC, color_id ASC
+            `
+        );
+
+        return res.json({
+            message: "Lấy danh sách màu thành công!",
+            colors: rows
+        });
+
+    } catch (error) {
+        console.error("Lỗi lấy danh sách colors:", error);
+        return res.status(500).json({
+            error: "Không thể lấy danh sách màu!"
+        });
+    }
+});
+
 // =========================================================================
 // ROUTE MỞ: LẤY DANH SÁCH DANH MỤC
 // =========================================================================
@@ -196,41 +468,17 @@ app.get('/api/products/:productId', async (req, res) => {
     const { productId } = req.params;
 
     try {
-        const [rows] = await dbPool.execute(
-            `
-            SELECT 
-                p.product_id,
-                p.product_name,
-                p.description,
-                p.category_id,
-                p.price,
-                p.stock_quantity,
-                p.sold_quantity,
-                p.image_key,
-                p.created_at,
-                p.updated_at,
-                c.category_name
-            FROM products p
-            LEFT JOIN categories c ON p.category_id = c.category_id
-            WHERE p.product_id = ?
-            `,
-            [productId]
-        );
+        const product = await getProductDetail(productId);
 
-        if (rows.length === 0) {
+        if (!product) {
             return res.status(404).json({
                 error: "Không tìm thấy sản phẩm!"
             });
         }
 
-        const product = rows[0];
-
         return res.json({
             message: "Lấy chi tiết sản phẩm thành công!",
-            product: {
-                ...product,
-                imageUrl: buildImageUrl(product.image_key)
-            }
+            product
         });
 
     } catch (error) {
@@ -297,36 +545,60 @@ app.post('/api/products', authMiddleware, adminMiddleware, async (req, res) => {
         description,
         categoryId,
         price,
-        stockQuantity,
-        imageKey
+        imageKey,
+        subImageKeys,
+        variants
     } = req.body || {};
 
-    if (!productName || price === undefined || stockQuantity === undefined) {
+    let cleanSubImageKeys;
+    let cleanVariants;
+
+    if (!productName || !productName.trim() || price === undefined) {
         return res.status(400).json({
-            error: "Vui lòng nhập đầy đủ tên sản phẩm, giá tiền và số lượng kho!"
+            error: "Vui lòng nhập đầy đủ tên sản phẩm và giá tiền!"
         });
     }
 
-    if (Number(price) <= 0) {
+    const nextPrice = Number(price);
+
+    if (Number.isNaN(nextPrice) || nextPrice <= 0) {
         return res.status(400).json({
             error: "Giá sản phẩm phải lớn hơn 0!"
         });
     }
 
-    if (Number(stockQuantity) < 0) {
-        return res.status(400).json({
-            error: "Số lượng kho không được nhỏ hơn 0!"
-        });
-    }
-
-    if (imageKey && !imageKey.startsWith("products/")) {
+    if (!isValidImageKey(imageKey)) {
         return res.status(400).json({
             error: "imageKey không hợp lệ!"
         });
     }
 
     try {
-        const [result] = await dbPool.execute(
+        cleanSubImageKeys = normalizeSubImageKeys(subImageKeys);
+        cleanVariants = normalizeVariants(variants);
+    } catch (error) {
+        return res.status(400).json({
+            error: error.message
+        });
+    }
+
+    let connection;
+
+    try {
+        connection = await dbPool.getConnection();
+        await connection.beginTransaction();
+
+        const totalStockQuantity = cleanVariants.reduce(
+            (sum, variant) => sum + variant.stockQuantity,
+            0
+        );
+
+        const totalSoldQuantity = cleanVariants.reduce(
+            (sum, variant) => sum + variant.soldQuantity,
+            0
+        );
+
+        const [result] = await connection.execute(
             `
             INSERT INTO products (
                 product_name,
@@ -334,38 +606,96 @@ app.post('/api/products', authMiddleware, adminMiddleware, async (req, res) => {
                 category_id,
                 price,
                 stock_quantity,
+                sold_quantity,
                 image_key
             )
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             `,
             [
                 productName.trim(),
                 description ? description.trim() : null,
                 categoryId || null,
-                price,
-                stockQuantity,
+                nextPrice,
+                totalStockQuantity,
+                totalSoldQuantity,
                 imageKey || null
             ]
         );
 
+        const productId = result.insertId;
+
+        for (let index = 0; index < cleanSubImageKeys.length; index += 1) {
+            await connection.execute(
+                `
+                INSERT INTO product_images (
+                    product_id,
+                    image_key,
+                    sort_order
+                )
+                VALUES (?, ?, ?)
+                `,
+                [productId, cleanSubImageKeys[index], index + 1]
+            );
+        }
+
+        for (const variant of cleanVariants) {
+            await connection.execute(
+                `
+                INSERT INTO product_variants (
+                    product_id,
+                    size_id,
+                    color_id,
+                    stock_quantity,
+                    sold_quantity,
+                    is_active
+                )
+                VALUES (?, ?, ?, ?, ?, 1)
+                `,
+                [
+                    productId,
+                    variant.sizeId,
+                    variant.colorId,
+                    variant.stockQuantity,
+                    variant.soldQuantity
+                ]
+            );
+        }
+
+        await syncProductTotals(connection, productId);
+        await connection.commit();
+
+        const product = await getProductDetail(productId);
+
         return res.status(201).json({
             message: "Admin đã tạo sản phẩm mới thành công!",
-            productId: result.insertId,
-            imageUrl: buildImageUrl(imageKey)
+            product
         });
 
     } catch (error) {
+        if (connection) {
+            await connection.rollback();
+        }
+
         console.error("Lỗi tạo sản phẩm:", error);
 
         if (error.code === "ER_NO_REFERENCED_ROW_2") {
             return res.status(400).json({
-                error: "categoryId không tồn tại!"
+                error: "categoryId, sizeId hoặc colorId không tồn tại!"
+            });
+        }
+
+        if (error.code === "ER_DUP_ENTRY") {
+            return res.status(400).json({
+                error: "Có biến thể bị trùng size và màu!"
             });
         }
 
         return res.status(500).json({
             error: "Không thể tạo sản phẩm, lỗi hệ thống!"
         });
+
+    } finally {
+        if (connection) connection.release();
     }
 });
 // =========================================================================
