@@ -163,37 +163,6 @@ function normalizeVariants(variants) {
     return normalized;
 }
 
-async function syncProductTotals(connection, productId) {
-    const [rows] = await connection.execute(
-        `
-        SELECT
-            COALESCE(SUM(stock_quantity), 0) AS total_stock_quantity,
-            COALESCE(SUM(sold_quantity), 0) AS total_sold_quantity
-        FROM product_variants
-        WHERE product_id = ?
-          AND is_active = 1
-        `,
-        [productId]
-    );
-
-    const totals = rows[0];
-
-    await connection.execute(
-        `
-        UPDATE products
-        SET
-            stock_quantity = ?,
-            sold_quantity = ?
-        WHERE product_id = ?
-        `,
-        [
-            totals.total_stock_quantity || 0,
-            totals.total_sold_quantity || 0,
-            productId
-        ]
-    );
-}
-
 async function getProductDetail(productId) {
     const [productRows] = await dbPool.execute(
         `
@@ -203,8 +172,8 @@ async function getProductDetail(productId) {
             p.description,
             p.category_id,
             p.price,
-            COALESCE(totals.total_stock_quantity, p.stock_quantity, 0) AS stock_quantity,
-            COALESCE(totals.total_sold_quantity, p.sold_quantity, 0) AS sold_quantity,
+            COALESCE(totals.total_stock_quantity, 0) AS stock_quantity,
+            COALESCE(totals.total_sold_quantity, 0) AS sold_quantity,
             p.image_key,
             p.created_at,
             p.updated_at,
@@ -338,8 +307,8 @@ app.get('/api/products', async (req, res) => {
                 p.category_id,  
                 p.description,
                 p.price,
-                COALESCE(totals.total_stock_quantity, p.stock_quantity, 0) AS stock_quantity,
-                COALESCE(totals.total_sold_quantity, p.sold_quantity, 0) AS sold_quantity,
+                COALESCE(totals.total_stock_quantity, 0) AS stock_quantity,
+                COALESCE(totals.total_sold_quantity, 0) AS sold_quantity,
                 p.image_key,
                 p.created_at,
                 p.updated_at,
@@ -588,16 +557,6 @@ app.post('/api/products', authMiddleware, adminMiddleware, async (req, res) => {
         connection = await dbPool.getConnection();
         await connection.beginTransaction();
 
-        const totalStockQuantity = cleanVariants.reduce(
-            (sum, variant) => sum + variant.stockQuantity,
-            0
-        );
-
-        const totalSoldQuantity = cleanVariants.reduce(
-            (sum, variant) => sum + variant.soldQuantity,
-            0
-        );
-
         const [result] = await connection.execute(
             `
             INSERT INTO products (
@@ -605,19 +564,15 @@ app.post('/api/products', authMiddleware, adminMiddleware, async (req, res) => {
                 description,
                 category_id,
                 price,
-                stock_quantity,
-                sold_quantity,
                 image_key
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?)
             `,
             [
                 productName.trim(),
                 description ? description.trim() : null,
                 categoryId || null,
                 nextPrice,
-                totalStockQuantity,
-                totalSoldQuantity,
                 imageKey || null
             ]
         );
@@ -661,7 +616,6 @@ app.post('/api/products', authMiddleware, adminMiddleware, async (req, res) => {
             );
         }
 
-        await syncProductTotals(connection, productId);
         await connection.commit();
 
         const product = await getProductDetail(productId);
@@ -943,8 +897,6 @@ app.put('/api/products/:productId', authMiddleware, adminMiddleware, async (req,
                 );
             }
         }
-
-        await syncProductTotals(connection, productId);
 
         await connection.commit();
 
