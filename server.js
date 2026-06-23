@@ -163,6 +163,38 @@ function normalizeVariants(variants) {
     return normalized;
 }
 
+function parseOptionalDisplayOrder(value) {
+    if (value === undefined || value === null || value === "") {
+        return null;
+    }
+
+    const numberValue = Number(value);
+
+    if (!Number.isInteger(numberValue) || numberValue < 0) {
+        return null;
+    }
+
+    return numberValue;
+}
+
+function normalizeColorCode(value) {
+    if (value === undefined) {
+        return undefined;
+    }
+
+    if (value === null || String(value).trim() === "") {
+        return null;
+    }
+
+    const colorCode = String(value).trim();
+
+    if (!/^#[0-9A-Fa-f]{6}$/.test(colorCode)) {
+        throw new Error("Mã màu phải có dạng #RRGGBB, ví dụ #FF0000.");
+    }
+
+    return colorCode;
+}
+
 async function getProductDetail(productId) {
     const [productRows] = await dbPool.execute(
         `
@@ -1175,6 +1207,412 @@ app.delete('/api/categories/:categoryId', authMiddleware, adminMiddleware, async
         });
     }
 });
+
+// =========================================================================
+// ROUTE BẢO MẬT: ADMIN TẠO SIZE
+// =========================================================================
+app.post('/api/sizes', authMiddleware, adminMiddleware, async (req, res) => {
+    const { sizeName, displayOrder } = req.body || {};
+
+    if (!sizeName || !String(sizeName).trim()) {
+        return res.status(400).json({
+            error: "Tên size không được để trống!"
+        });
+    }
+
+    const cleanSizeName = String(sizeName).trim().toUpperCase();
+    let cleanDisplayOrder = parseOptionalDisplayOrder(displayOrder);
+
+    try {
+        if (cleanDisplayOrder === null) {
+            const [orderRows] = await dbPool.execute(
+                `
+                SELECT COALESCE(MAX(display_order), 0) + 1 AS next_display_order
+                FROM sizes
+                `
+            );
+
+            cleanDisplayOrder = orderRows[0].next_display_order || 1;
+        }
+
+        const [result] = await dbPool.execute(
+            `
+            INSERT INTO sizes (
+                size_name,
+                display_order
+            )
+            VALUES (?, ?)
+            `,
+            [cleanSizeName, cleanDisplayOrder]
+        );
+
+        return res.status(201).json({
+            message: "Admin đã tạo size thành công!",
+            sizeId: result.insertId
+        });
+
+    } catch (error) {
+        console.error("Lỗi tạo size:", error);
+
+        if (error.code === "ER_DUP_ENTRY") {
+            return res.status(400).json({
+                error: "Size này đã tồn tại!"
+            });
+        }
+
+        return res.status(500).json({
+            error: "Không thể tạo size!"
+        });
+    }
+});
+
+// =========================================================================
+// ROUTE BẢO MẬT: ADMIN SỬA SIZE
+// =========================================================================
+app.put('/api/sizes/:sizeId', authMiddleware, adminMiddleware, async (req, res) => {
+    const { sizeId } = req.params;
+    const { sizeName, displayOrder } = req.body || {};
+
+    if (!sizeName || !String(sizeName).trim()) {
+        return res.status(400).json({
+            error: "Tên size không được để trống!"
+        });
+    }
+
+    const cleanSizeName = String(sizeName).trim().toUpperCase();
+    const cleanDisplayOrder = parseOptionalDisplayOrder(displayOrder);
+
+    try {
+        const [rows] = await dbPool.execute(
+            `
+            SELECT size_id
+            FROM sizes
+            WHERE size_id = ?
+            `,
+            [sizeId]
+        );
+
+        if (rows.length === 0) {
+            return res.status(404).json({
+                error: "Không tìm thấy size cần sửa!"
+            });
+        }
+
+        if (cleanDisplayOrder === null) {
+            await dbPool.execute(
+                `
+                UPDATE sizes
+                SET size_name = ?
+                WHERE size_id = ?
+                `,
+                [cleanSizeName, sizeId]
+            );
+        } else {
+            await dbPool.execute(
+                `
+                UPDATE sizes
+                SET
+                    size_name = ?,
+                    display_order = ?
+                WHERE size_id = ?
+                `,
+                [cleanSizeName, cleanDisplayOrder, sizeId]
+            );
+        }
+
+        return res.json({
+            message: "Admin đã cập nhật size thành công!"
+        });
+
+    } catch (error) {
+        console.error("Lỗi sửa size:", error);
+
+        if (error.code === "ER_DUP_ENTRY") {
+            return res.status(400).json({
+                error: "Tên size này đã tồn tại!"
+            });
+        }
+
+        return res.status(500).json({
+            error: "Không thể sửa size!"
+        });
+    }
+});
+
+// =========================================================================
+// ROUTE BẢO MẬT: ADMIN XÓA SIZE
+// =========================================================================
+app.delete('/api/sizes/:sizeId', authMiddleware, adminMiddleware, async (req, res) => {
+    const { sizeId } = req.params;
+
+    try {
+        const [rows] = await dbPool.execute(
+            `
+            SELECT size_id, size_name
+            FROM sizes
+            WHERE size_id = ?
+            `,
+            [sizeId]
+        );
+
+        if (rows.length === 0) {
+            return res.status(404).json({
+                error: "Không tìm thấy size cần xóa!"
+            });
+        }
+
+        const [usedRows] = await dbPool.execute(
+            `
+            SELECT COUNT(*) AS used_count
+            FROM product_variants
+            WHERE size_id = ?
+            `,
+            [sizeId]
+        );
+
+        if (Number(usedRows[0].used_count) > 0) {
+            return res.status(400).json({
+                error: "Không thể xóa size này vì đang được dùng bởi biến thể sản phẩm."
+            });
+        }
+
+        await dbPool.execute(
+            `
+            DELETE FROM sizes
+            WHERE size_id = ?
+            `,
+            [sizeId]
+        );
+
+        return res.json({
+            message: "Admin đã xóa size thành công!"
+        });
+
+    } catch (error) {
+        console.error("Lỗi xóa size:", error);
+
+        return res.status(500).json({
+            error: "Không thể xóa size!"
+        });
+    }
+});
+
+// =========================================================================
+// ROUTE BẢO MẬT: ADMIN TẠO MÀU
+// =========================================================================
+app.post('/api/colors', authMiddleware, adminMiddleware, async (req, res) => {
+    const { colorName, colorCode, displayOrder } = req.body || {};
+
+    if (!colorName || !String(colorName).trim()) {
+        return res.status(400).json({
+            error: "Tên màu không được để trống!"
+        });
+    }
+
+    const cleanColorName = String(colorName).trim();
+    let cleanColorCode;
+
+    try {
+        cleanColorCode = normalizeColorCode(colorCode);
+    } catch (error) {
+        return res.status(400).json({
+            error: error.message
+        });
+    }
+
+    let cleanDisplayOrder = parseOptionalDisplayOrder(displayOrder);
+
+    try {
+        if (cleanDisplayOrder === null) {
+            const [orderRows] = await dbPool.execute(
+                `
+                SELECT COALESCE(MAX(display_order), 0) + 1 AS next_display_order
+                FROM colors
+                `
+            );
+
+            cleanDisplayOrder = orderRows[0].next_display_order || 1;
+        }
+
+        const [result] = await dbPool.execute(
+            `
+            INSERT INTO colors (
+                color_name,
+                color_code,
+                display_order
+            )
+            VALUES (?, ?, ?)
+            `,
+            [
+                cleanColorName,
+                cleanColorCode === undefined ? null : cleanColorCode,
+                cleanDisplayOrder
+            ]
+        );
+
+        return res.status(201).json({
+            message: "Admin đã tạo màu thành công!",
+            colorId: result.insertId
+        });
+
+    } catch (error) {
+        console.error("Lỗi tạo color:", error);
+
+        if (error.code === "ER_DUP_ENTRY") {
+            return res.status(400).json({
+                error: "Màu này đã tồn tại!"
+            });
+        }
+
+        return res.status(500).json({
+            error: "Không thể tạo màu!"
+        });
+    }
+});
+
+// =========================================================================
+// ROUTE BẢO MẬT: ADMIN SỬA MÀU
+// =========================================================================
+app.put('/api/colors/:colorId', authMiddleware, adminMiddleware, async (req, res) => {
+    const { colorId } = req.params;
+    const { colorName, colorCode, displayOrder } = req.body || {};
+
+    if (!colorName || !String(colorName).trim()) {
+        return res.status(400).json({
+            error: "Tên màu không được để trống!"
+        });
+    }
+
+    const cleanColorName = String(colorName).trim();
+    let cleanColorCode;
+
+    try {
+        cleanColorCode = normalizeColorCode(colorCode);
+    } catch (error) {
+        return res.status(400).json({
+            error: error.message
+        });
+    }
+
+    const cleanDisplayOrder = parseOptionalDisplayOrder(displayOrder);
+
+    try {
+        const [rows] = await dbPool.execute(
+            `
+            SELECT color_id
+            FROM colors
+            WHERE color_id = ?
+            `,
+            [colorId]
+        );
+
+        if (rows.length === 0) {
+            return res.status(404).json({
+                error: "Không tìm thấy màu cần sửa!"
+            });
+        }
+
+        const updateFields = ["color_name = ?"];
+        const params = [cleanColorName];
+
+        if (cleanColorCode !== undefined) {
+            updateFields.push("color_code = ?");
+            params.push(cleanColorCode);
+        }
+
+        if (cleanDisplayOrder !== null) {
+            updateFields.push("display_order = ?");
+            params.push(cleanDisplayOrder);
+        }
+
+        params.push(colorId);
+
+        await dbPool.execute(
+            `
+            UPDATE colors
+            SET ${updateFields.join(", ")}
+            WHERE color_id = ?
+            `,
+            params
+        );
+
+        return res.json({
+            message: "Admin đã cập nhật màu thành công!"
+        });
+
+    } catch (error) {
+        console.error("Lỗi sửa color:", error);
+
+        if (error.code === "ER_DUP_ENTRY") {
+            return res.status(400).json({
+                error: "Tên màu này đã tồn tại!"
+            });
+        }
+
+        return res.status(500).json({
+            error: "Không thể sửa màu!"
+        });
+    }
+});
+
+// =========================================================================
+// ROUTE BẢO MẬT: ADMIN XÓA MÀU
+// =========================================================================
+app.delete('/api/colors/:colorId', authMiddleware, adminMiddleware, async (req, res) => {
+    const { colorId } = req.params;
+
+    try {
+        const [rows] = await dbPool.execute(
+            `
+            SELECT color_id, color_name
+            FROM colors
+            WHERE color_id = ?
+            `,
+            [colorId]
+        );
+
+        if (rows.length === 0) {
+            return res.status(404).json({
+                error: "Không tìm thấy màu cần xóa!"
+            });
+        }
+
+        const [usedRows] = await dbPool.execute(
+            `
+            SELECT COUNT(*) AS used_count
+            FROM product_variants
+            WHERE color_id = ?
+            `,
+            [colorId]
+        );
+
+        if (Number(usedRows[0].used_count) > 0) {
+            return res.status(400).json({
+                error: "Không thể xóa màu này vì đang được dùng bởi biến thể sản phẩm."
+            });
+        }
+
+        await dbPool.execute(
+            `
+            DELETE FROM colors
+            WHERE color_id = ?
+            `,
+            [colorId]
+        );
+
+        return res.json({
+            message: "Admin đã xóa màu thành công!"
+        });
+
+    } catch (error) {
+        console.error("Lỗi xóa color:", error);
+
+        return res.status(500).json({
+            error: "Không thể xóa màu!"
+        });
+    }
+});
+
 // Khởi chạy Product Service ở cổng 3001
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
