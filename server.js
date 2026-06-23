@@ -709,15 +709,41 @@ app.put('/api/products/:productId', authMiddleware, adminMiddleware, async (req,
         description,
         categoryId,
         price,
-        stockQuantity,
-        soldQuantity,
-        imageKey
+        imageKey,
+        subImageKeys,
+        variants
     } = req.body || {};
 
+    let cleanSubImageKeys;
+    let cleanVariants;
+
+    if (subImageKeys !== undefined) {
+        try {
+            cleanSubImageKeys = normalizeSubImageKeys(subImageKeys);
+        } catch (error) {
+            return res.status(400).json({
+                error: error.message
+            });
+        }
+    }
+
+    if (variants !== undefined) {
+        try {
+            cleanVariants = normalizeVariants(variants);
+        } catch (error) {
+            return res.status(400).json({
+                error: error.message
+            });
+        }
+    }
+
     let connection;
+    let oldMainImageKey = null;
+    let oldSubImageKeys = [];
 
     try {
         connection = await dbPool.getConnection();
+        await connection.beginTransaction();
 
         const [rows] = await connection.execute(
             `
@@ -727,8 +753,6 @@ app.put('/api/products/:productId', authMiddleware, adminMiddleware, async (req,
                 description,
                 category_id,
                 price,
-                stock_quantity,
-                sold_quantity,
                 image_key
             FROM products
             WHERE product_id = ?
@@ -737,12 +761,15 @@ app.put('/api/products/:productId', authMiddleware, adminMiddleware, async (req,
         );
 
         if (rows.length === 0) {
+            await connection.rollback();
+
             return res.status(404).json({
                 error: "Không tìm thấy sản phẩm cần sửa!"
             });
         }
 
         const currentProduct = rows[0];
+        oldMainImageKey = currentProduct.image_key;
 
         const nextProductName =
             productName !== undefined ? productName.trim() : currentProduct.product_name;
@@ -753,47 +780,39 @@ app.put('/api/products/:productId', authMiddleware, adminMiddleware, async (req,
                 : currentProduct.description;
 
         const nextCategoryId =
-            categoryId !== undefined && categoryId !== null && categoryId !== ""
-                ? Number(categoryId)
-                : null;
+            categoryId !== undefined
+                ? (
+                    categoryId !== null && categoryId !== ""
+                        ? Number(categoryId)
+                        : null
+                )
+                : currentProduct.category_id;
 
         const nextPrice =
             price !== undefined ? Number(price) : Number(currentProduct.price);
 
-        const nextStockQuantity =
-            stockQuantity !== undefined ? Number(stockQuantity) : Number(currentProduct.stock_quantity);
-        
-        const nextSoldQuantity =
-            soldQuantity !== undefined ? Number(soldQuantity) : Number(currentProduct.sold_quantity);
-        
         const nextImageKey =
             imageKey !== undefined ? imageKey : currentProduct.image_key;
 
         if (!nextProductName) {
+            await connection.rollback();
+
             return res.status(400).json({
                 error: "Tên sản phẩm không được để trống!"
             });
         }
 
         if (Number.isNaN(nextPrice) || nextPrice <= 0) {
+            await connection.rollback();
+
             return res.status(400).json({
                 error: "Giá sản phẩm phải lớn hơn 0!"
             });
         }
 
-        if (Number.isNaN(nextStockQuantity) || nextStockQuantity < 0) {
-            return res.status(400).json({
-                error: "Số lượng kho không được nhỏ hơn 0!"
-            });
-        }
+        if (!isValidImageKey(nextImageKey)) {
+            await connection.rollback();
 
-        if (Number.isNaN(nextSoldQuantity) || nextSoldQuantity < 0) {
-            return res.status(400).json({
-                error: "Số lượng đã bán không được nhỏ hơn 0!"
-            });
-        }
-
-        if (nextImageKey && !nextImageKey.startsWith("products/")) {
             return res.status(400).json({
                 error: "imageKey không hợp lệ!"
             });
@@ -807,8 +826,6 @@ app.put('/api/products/:productId', authMiddleware, adminMiddleware, async (req,
                 description = ?,
                 category_id = ?,
                 price = ?,
-                stock_quantity = ?,
-                sold_quantity = ?,
                 image_key = ?
             WHERE product_id = ?
             `,
@@ -817,59 +834,163 @@ app.put('/api/products/:productId', authMiddleware, adminMiddleware, async (req,
                 nextDescription || null,
                 nextCategoryId,
                 nextPrice,
-                nextStockQuantity,
-                nextSoldQuantity,
                 nextImageKey || null,
                 productId
             ]
         );
 
-        // Nếu admin đổi sang ảnh mới thì xóa ảnh cũ khỏi S3
-        if (
-            currentProduct.image_key &&
-            nextImageKey &&
-            currentProduct.image_key !== nextImageKey
-        ) {
-            await deleteImageFromS3(currentProduct.image_key);
+        // Nếu FE gửi subImageKeys thì cập nhật lại toàn bộ ảnh phụ
+        // Nếu không gửi subImageKeys thì giữ nguyên ảnh phụ cũ
+        if (cleanSubImageKeys !== undefined) {
+            const [oldImageRows] = await connection.execute(
+                `
+                SELECT image_key
+                FROM product_images
+                WHERE product_id = ?
+                `,
+                [productId]
+            );
+
+            oldSubImageKeys = oldImageRows.map(row => row.image_key);
+
+            await connection.execute(
+                `
+                DELETE FROM product_images
+                WHERE product_id = ?
+                `,
+                [productId]
+            );
+
+            for (let index = 0; index < cleanSubImageKeys.length; index += 1) {
+                await connection.execute(
+                    `
+                    INSERT INTO product_images (
+                        product_id,
+                        image_key,
+                        sort_order
+                    )
+                    VALUES (?, ?, ?)
+                    `,
+                    [productId, cleanSubImageKeys[index], index + 1]
+                );
+            }
         }
 
-        const [updatedRows] = await connection.execute(
-            `
-            SELECT
-                p.product_id,
-                p.product_name,
-                p.description,
-                p.category_id,
-                p.price,
-                p.stock_quantity,
-                p.sold_quantity,
-                p.image_key,
-                p.created_at,
-                p.updated_at,
-                c.category_name
-            FROM products p
-            LEFT JOIN categories c ON p.category_id = c.category_id
-            WHERE p.product_id = ?
-            `,
-            [productId]
-        );
+        // Nếu FE gửi variants thì cập nhật lại danh sách biến thể
+        // Variant cũ không còn dùng nữa sẽ chuyển is_active = 0
+        if (cleanVariants !== undefined) {
+            const [oldVariantRows] = await connection.execute(
+                `
+                SELECT
+                    size_id,
+                    color_id,
+                    sold_quantity
+                FROM product_variants
+                WHERE product_id = ?
+                `,
+                [productId]
+            );
 
-        const updatedProduct = updatedRows[0];
+            const oldSoldQuantityMap = new Map();
+
+            for (const oldVariant of oldVariantRows) {
+                oldSoldQuantityMap.set(
+                    `${oldVariant.size_id}:${oldVariant.color_id}`,
+                    Number(oldVariant.sold_quantity) || 0
+                );
+            }
+
+            await connection.execute(
+                `
+                UPDATE product_variants
+                SET is_active = 0
+                WHERE product_id = ?
+                `,
+                [productId]
+            );
+
+            for (const variant of cleanVariants) {
+                const variantKey = `${variant.sizeId}:${variant.colorId}`;
+
+                const preservedSoldQuantity =
+                    oldSoldQuantityMap.has(variantKey)
+                        ? oldSoldQuantityMap.get(variantKey)
+                        : variant.soldQuantity;
+
+                await connection.execute(
+                    `
+                    INSERT INTO product_variants (
+                        product_id,
+                        size_id,
+                        color_id,
+                        stock_quantity,
+                        sold_quantity,
+                        is_active
+                    )
+                    VALUES (?, ?, ?, ?, ?, 1)
+                    ON DUPLICATE KEY UPDATE
+                        stock_quantity = VALUES(stock_quantity),
+                        sold_quantity = VALUES(sold_quantity),
+                        is_active = 1
+                    `,
+                    [
+                        productId,
+                        variant.sizeId,
+                        variant.colorId,
+                        variant.stockQuantity,
+                        preservedSoldQuantity
+                    ]
+                );
+            }
+        }
+
+        await syncProductTotals(connection, productId);
+
+        await connection.commit();
+
+        // Xóa ảnh chính cũ khỏi S3 nếu admin đổi sang ảnh chính mới
+        if (
+            oldMainImageKey &&
+            nextImageKey &&
+            oldMainImageKey !== nextImageKey
+        ) {
+            await deleteImageFromS3(oldMainImageKey);
+        }
+
+        // Xóa ảnh phụ cũ khỏi S3 nếu không còn nằm trong danh sách ảnh phụ mới
+        if (cleanSubImageKeys !== undefined) {
+            const removedSubImageKeys = oldSubImageKeys.filter(
+                oldKey => !cleanSubImageKeys.includes(oldKey)
+            );
+
+            for (const removedKey of removedSubImageKeys) {
+                await deleteImageFromS3(removedKey);
+            }
+        }
+
+        const product = await getProductDetail(productId);
 
         return res.json({
             message: "Admin đã cập nhật sản phẩm thành công!",
-            product: {
-                ...updatedProduct,
-                imageUrl: buildImageUrl(updatedProduct.image_key)
-            }
+            product
         });
 
     } catch (error) {
+        if (connection) {
+            await connection.rollback();
+        }
+
         console.error("Lỗi sửa sản phẩm:", error);
 
         if (error.code === "ER_NO_REFERENCED_ROW_2") {
             return res.status(400).json({
-                error: "categoryId không tồn tại!"
+                error: "categoryId, sizeId hoặc colorId không tồn tại!"
+            });
+        }
+
+        if (error.code === "ER_DUP_ENTRY") {
+            return res.status(400).json({
+                error: "Có biến thể bị trùng size và màu!"
             });
         }
 
@@ -888,9 +1009,11 @@ app.delete('/api/products/:productId', authMiddleware, adminMiddleware, async (r
     const { productId } = req.params;
 
     let connection;
+    let imageKeysToDelete = [];
 
     try {
         connection = await dbPool.getConnection();
+        await connection.beginTransaction();
 
         const [rows] = await connection.execute(
             `
@@ -902,12 +1025,33 @@ app.delete('/api/products/:productId', authMiddleware, adminMiddleware, async (r
         );
 
         if (rows.length === 0) {
+            await connection.rollback();
+
             return res.status(404).json({
                 error: "Không tìm thấy sản phẩm cần xóa!"
             });
         }
 
         const product = rows[0];
+
+        if (product.image_key) {
+            imageKeysToDelete.push(product.image_key);
+        }
+
+        const [imageRows] = await connection.execute(
+            `
+            SELECT image_key
+            FROM product_images
+            WHERE product_id = ?
+            `,
+            [productId]
+        );
+
+        imageKeysToDelete = imageKeysToDelete.concat(
+            imageRows
+                .map(row => row.image_key)
+                .filter(Boolean)
+        );
 
         await connection.execute(
             `
@@ -917,9 +1061,10 @@ app.delete('/api/products/:productId', authMiddleware, adminMiddleware, async (r
             [productId]
         );
 
-        // Xóa object ảnh khỏi S3 nếu có
-        if (product.image_key) {
-            await deleteImageFromS3(product.image_key);
+        await connection.commit();
+
+        for (const imageKey of imageKeysToDelete) {
+            await deleteImageFromS3(imageKey);
         }
 
         return res.json({
@@ -927,6 +1072,10 @@ app.delete('/api/products/:productId', authMiddleware, adminMiddleware, async (r
         });
 
     } catch (error) {
+        if (connection) {
+            await connection.rollback();
+        }
+
         console.error("Lỗi xóa sản phẩm:", error);
 
         return res.status(500).json({
