@@ -13,8 +13,6 @@ CREATE TABLE IF NOT EXISTS products (
     description TEXT NULL,
     category_id INT,
     price DECIMAL(12, 2) NOT NULL,
-    stock_quantity INT NOT NULL DEFAULT 0,
-    sold_quantity INT NOT NULL DEFAULT 0,
     image_key VARCHAR(500),
 
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
