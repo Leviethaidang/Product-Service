@@ -122,11 +122,6 @@ function normalizeVariants(variants) {
     for (const variant of variants) {
         const sizeId = Number(variant.sizeId);
         const colorId = Number(variant.colorId);
-        const stockQuantity = Number(variant.stockQuantity);
-        const soldQuantity =
-            variant.soldQuantity !== undefined && variant.soldQuantity !== null
-                ? Number(variant.soldQuantity)
-                : 0;
 
         if (!Number.isInteger(sizeId) || sizeId <= 0) {
             throw new Error("sizeId của biến thể không hợp lệ!");
@@ -134,14 +129,6 @@ function normalizeVariants(variants) {
 
         if (!Number.isInteger(colorId) || colorId <= 0) {
             throw new Error("colorId của biến thể không hợp lệ!");
-        }
-
-        if (!Number.isInteger(stockQuantity) || stockQuantity < 0) {
-            throw new Error("stockQuantity của biến thể không hợp lệ!");
-        }
-
-        if (!Number.isInteger(soldQuantity) || soldQuantity < 0) {
-            throw new Error("soldQuantity của biến thể không hợp lệ!");
         }
 
         const duplicateKey = `${sizeId}:${colorId}`;
@@ -154,9 +141,7 @@ function normalizeVariants(variants) {
 
         normalized.push({
             sizeId,
-            colorId,
-            stockQuantity,
-            soldQuantity
+            colorId
         });
     }
 
@@ -204,23 +189,12 @@ async function getProductDetail(productId) {
             p.description,
             p.category_id,
             p.price,
-            COALESCE(totals.total_stock_quantity, 0) AS stock_quantity,
-            COALESCE(totals.total_sold_quantity, 0) AS sold_quantity,
             p.image_key,
             p.created_at,
             p.updated_at,
             c.category_name
         FROM products p
         LEFT JOIN categories c ON p.category_id = c.category_id
-        LEFT JOIN (
-            SELECT
-                product_id,
-                COALESCE(SUM(stock_quantity), 0) AS total_stock_quantity,
-                COALESCE(SUM(sold_quantity), 0) AS total_sold_quantity
-            FROM product_variants
-            WHERE is_active = 1
-            GROUP BY product_id
-        ) totals ON totals.product_id = p.product_id
         WHERE p.product_id = ?
         `,
         [productId]
@@ -257,8 +231,6 @@ async function getProductDetail(productId) {
             pv.color_id,
             c.color_name,
             c.color_code,
-            pv.stock_quantity,
-            pv.sold_quantity,
             pv.is_active,
             pv.created_at,
             pv.updated_at
@@ -339,23 +311,12 @@ app.get('/api/products', async (req, res) => {
                 p.category_id,  
                 p.description,
                 p.price,
-                COALESCE(totals.total_stock_quantity, 0) AS stock_quantity,
-                COALESCE(totals.total_sold_quantity, 0) AS sold_quantity,
                 p.image_key,
                 p.created_at,
                 p.updated_at,
                 c.category_name
             FROM products p
             LEFT JOIN categories c ON p.category_id = c.category_id
-            LEFT JOIN (
-                SELECT
-                    product_id,
-                    COALESCE(SUM(stock_quantity), 0) AS total_stock_quantity,
-                    COALESCE(SUM(sold_quantity), 0) AS total_sold_quantity
-                FROM product_variants
-                WHERE is_active = 1
-                GROUP BY product_id
-            ) totals ON totals.product_id = p.product_id
             ORDER BY p.created_at DESC
         `);
 
@@ -632,18 +593,14 @@ app.post('/api/products', authMiddleware, adminMiddleware, async (req, res) => {
                     product_id,
                     size_id,
                     color_id,
-                    stock_quantity,
-                    sold_quantity,
                     is_active
                 )
-                VALUES (?, ?, ?, ?, ?, 1)
+                VALUES (?, ?, ?, 1)
                 `,
                 [
                     productId,
                     variant.sizeId,
-                    variant.colorId,
-                    variant.stockQuantity,
-                    variant.soldQuantity
+                    variant.colorId
                 ]
             );
         }
@@ -865,27 +822,6 @@ app.put('/api/products/:productId', authMiddleware, adminMiddleware, async (req,
         // Nếu FE gửi variants thì cập nhật lại danh sách biến thể
         // Variant cũ không còn dùng nữa sẽ chuyển is_active = 0
         if (cleanVariants !== undefined) {
-            const [oldVariantRows] = await connection.execute(
-                `
-                SELECT
-                    size_id,
-                    color_id,
-                    sold_quantity
-                FROM product_variants
-                WHERE product_id = ?
-                `,
-                [productId]
-            );
-
-            const oldSoldQuantityMap = new Map();
-
-            for (const oldVariant of oldVariantRows) {
-                oldSoldQuantityMap.set(
-                    `${oldVariant.size_id}:${oldVariant.color_id}`,
-                    Number(oldVariant.sold_quantity) || 0
-                );
-            }
-
             await connection.execute(
                 `
                 UPDATE product_variants
@@ -896,35 +832,22 @@ app.put('/api/products/:productId', authMiddleware, adminMiddleware, async (req,
             );
 
             for (const variant of cleanVariants) {
-                const variantKey = `${variant.sizeId}:${variant.colorId}`;
-
-                const preservedSoldQuantity =
-                    oldSoldQuantityMap.has(variantKey)
-                        ? oldSoldQuantityMap.get(variantKey)
-                        : variant.soldQuantity;
-
                 await connection.execute(
                     `
                     INSERT INTO product_variants (
                         product_id,
                         size_id,
                         color_id,
-                        stock_quantity,
-                        sold_quantity,
                         is_active
                     )
-                    VALUES (?, ?, ?, ?, ?, 1)
+                    VALUES (?, ?, ?, 1)
                     ON DUPLICATE KEY UPDATE
-                        stock_quantity = VALUES(stock_quantity),
-                        sold_quantity = VALUES(sold_quantity),
                         is_active = 1
                     `,
                     [
                         productId,
                         variant.sizeId,
-                        variant.colorId,
-                        variant.stockQuantity,
-                        preservedSoldQuantity
+                        variant.colorId
                     ]
                 );
             }
