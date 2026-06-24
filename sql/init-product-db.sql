@@ -51,8 +51,6 @@ CREATE TABLE IF NOT EXISTS product_variants (
     product_id INT NOT NULL,
     size_id INT NOT NULL,
     color_id INT NOT NULL,
-    stock_quantity INT NOT NULL DEFAULT 0,
-    sold_quantity INT NOT NULL DEFAULT 0,
     is_active TINYINT(1) NOT NULL DEFAULT 1,
 
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,

@@ -123,9 +123,7 @@ function normalizeVariants(variants) {
     for (const variant of variants) {
         const sizeId = Number(variant.sizeId);
         const colorId = Number(variant.colorId);
-        const quantityOnHand = Number(
-            variant.quantityOnHand ?? variant.stockQuantity ?? 0
-        );
+        const quantityOnHand = Number(variant.quantityOnHand ?? 0);
 
         if (!Number.isInteger(sizeId) || sizeId <= 0) {
             throw new Error("sizeId của biến thể không hợp lệ!");
@@ -685,7 +683,7 @@ app.post('/api/products', authMiddleware, adminMiddleware, async (req, res) => {
         }
 
         return res.status(201).json({
-            message: "Admin đã tạo sản phẩm mới và tồn kho thành công!",
+            message: "Đã tạo sản phẩm và đồng bộ Inventory thành công!",
             product
         });
 
@@ -963,7 +961,7 @@ app.put('/api/products/:productId', authMiddleware, adminMiddleware, async (req,
         }
 
         return res.json({
-            message: "Admin đã cập nhật sản phẩm và tồn kho thành công!",
+            message: "Đã cập nhật sản phẩm và đồng bộ Inventory thành công!",
             product
         });
 
@@ -1071,7 +1069,7 @@ app.delete('/api/products/:productId', authMiddleware, adminMiddleware, async (r
         }
 
         return res.json({
-            message: "Admin đã xóa sản phẩm và deactivate tồn kho thành công!"
+            message: "Đã xóa sản phẩm và deactivate Inventory thành công!"
         });
 
     } catch (error) {
