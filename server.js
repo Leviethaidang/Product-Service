@@ -6,6 +6,7 @@ const { CognitoJwtVerifier } = require('aws-jwt-verify');
 const { S3Client, PutObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const crypto = require('crypto');
+const axios = require('axios');
 
 const app = express();
 app.use(express.json());
@@ -122,6 +123,9 @@ function normalizeVariants(variants) {
     for (const variant of variants) {
         const sizeId = Number(variant.sizeId);
         const colorId = Number(variant.colorId);
+        const quantityOnHand = Number(
+            variant.quantityOnHand ?? variant.stockQuantity ?? 0
+        );
 
         if (!Number.isInteger(sizeId) || sizeId <= 0) {
             throw new Error("sizeId của biến thể không hợp lệ!");
@@ -129,6 +133,10 @@ function normalizeVariants(variants) {
 
         if (!Number.isInteger(colorId) || colorId <= 0) {
             throw new Error("colorId của biến thể không hợp lệ!");
+        }
+
+        if (!Number.isInteger(quantityOnHand) || quantityOnHand < 0) {
+            throw new Error("Số lượng tồn kho của biến thể không hợp lệ!");
         }
 
         const duplicateKey = `${sizeId}:${colorId}`;
@@ -141,7 +149,8 @@ function normalizeVariants(variants) {
 
         normalized.push({
             sizeId,
-            colorId
+            colorId,
+            quantityOnHand
         });
     }
 
@@ -253,6 +262,52 @@ async function getProductDetail(productId) {
         })),
         variants: variantRows
     };
+}
+
+function findSavedVariant(product, inputVariant) {
+    return (product.variants || []).find(variant => {
+        return Number(variant.size_id) === Number(inputVariant.sizeId)
+            && Number(variant.color_id) === Number(inputVariant.colorId);
+    }) || null;
+}
+
+async function updateInventoryForProduct(product, inputVariants) {
+    const inventoryServiceUrl = process.env.INVENTORY_SERVICE_URL;
+    const internalApiKey = process.env.INTERNAL_API_KEY;
+
+    if (!inventoryServiceUrl) {
+        throw new Error("Product Service chưa cấu hình INVENTORY_SERVICE_URL!");
+    }
+
+    if (!internalApiKey) {
+        throw new Error("Product Service chưa cấu hình INTERNAL_API_KEY!");
+    }
+
+    const items = inputVariants.map(inputVariant => {
+        const savedVariant = findSavedVariant(product, inputVariant);
+
+        if (!savedVariant) {
+            throw new Error(
+                `Không tìm thấy variant sau khi lưu Product. SizeId=${inputVariant.sizeId}, ColorId=${inputVariant.colorId}`
+            );
+        }
+
+        return {
+            variantId: Number(savedVariant.variant_id),
+            quantityOnHand: Number(inputVariant.quantityOnHand) || 0
+        };
+    });
+
+    await axios.post(
+        `${inventoryServiceUrl}/api/inventory/internal/products/${product.product_id}/items/bulk-upsert`,
+        { items },
+        {
+            headers: {
+                "x-internal-api-key": internalApiKey
+            },
+            timeout: 5000
+        }
+    );
 }
 
 // 6. MIDDLEWARE XÁC THỰC
@@ -609,8 +664,28 @@ app.post('/api/products', authMiddleware, adminMiddleware, async (req, res) => {
 
         const product = await getProductDetail(productId);
 
+        try {
+            await updateInventoryForProduct(product, cleanVariants);
+        } catch (inventoryError) {
+            console.error("Lỗi tạo inventory sau khi tạo product:", inventoryError);
+
+            // Compensation đơn giản cho project demo:
+            // Nếu tạo inventory thất bại, xóa product vừa tạo để tránh product không có tồn kho.
+            await dbPool.execute(
+                `
+                DELETE FROM products
+                WHERE product_id = ?
+                `,
+                [productId]
+            );
+
+            return res.status(500).json({
+                error: "Tạo sản phẩm thất bại vì không thể tạo tồn kho. Product đã được rollback."
+            });
+        }
+
         return res.status(201).json({
-            message: "Admin đã tạo sản phẩm mới thành công!",
+            message: "Admin đã tạo sản phẩm mới và tồn kho thành công!",
             product
         });
 
@@ -855,7 +930,6 @@ app.put('/api/products/:productId', authMiddleware, adminMiddleware, async (req,
 
         await connection.commit();
 
-        // Xóa ảnh chính cũ khỏi S3 nếu admin đổi sang ảnh chính mới
         if (
             oldMainImageKey &&
             nextImageKey &&
@@ -864,7 +938,6 @@ app.put('/api/products/:productId', authMiddleware, adminMiddleware, async (req,
             await deleteImageFromS3(oldMainImageKey);
         }
 
-        // Xóa ảnh phụ cũ khỏi S3 nếu không còn nằm trong danh sách ảnh phụ mới
         if (cleanSubImageKeys !== undefined) {
             const removedSubImageKeys = oldSubImageKeys.filter(
                 oldKey => !cleanSubImageKeys.includes(oldKey)
@@ -877,8 +950,20 @@ app.put('/api/products/:productId', authMiddleware, adminMiddleware, async (req,
 
         const product = await getProductDetail(productId);
 
+        if (cleanVariants !== undefined) {
+            try {
+                await updateInventoryForProduct(product, cleanVariants);
+            } catch (inventoryError) {
+                console.error("Lỗi cập nhật inventory sau khi cập nhật product:", inventoryError);
+
+                return res.status(500).json({
+                    error: "Product đã được cập nhật nhưng cập nhật tồn kho thất bại. Vui lòng kiểm tra lại Inventory Service."
+                });
+            }
+        }
+
         return res.json({
-            message: "Admin đã cập nhật sản phẩm thành công!",
+            message: "Admin đã cập nhật sản phẩm và tồn kho thành công!",
             product
         });
 
@@ -960,6 +1045,17 @@ app.delete('/api/products/:productId', authMiddleware, adminMiddleware, async (r
                 .filter(Boolean)
         );
 
+        await axios.post(
+            `${process.env.INVENTORY_SERVICE_URL}/api/inventory/internal/products/${productId}/deactivate`,
+            {},
+            {
+                headers: {
+                    "x-internal-api-key": process.env.INTERNAL_API_KEY
+                },
+                timeout: 5000
+            }
+        );
+
         await connection.execute(
             `
             DELETE FROM products
@@ -975,7 +1071,7 @@ app.delete('/api/products/:productId', authMiddleware, adminMiddleware, async (r
         }
 
         return res.json({
-            message: "Admin đã xóa sản phẩm thành công!"
+            message: "Admin đã xóa sản phẩm và deactivate tồn kho thành công!"
         });
 
     } catch (error) {
@@ -986,13 +1082,14 @@ app.delete('/api/products/:productId', authMiddleware, adminMiddleware, async (r
         console.error("Lỗi xóa sản phẩm:", error);
 
         return res.status(500).json({
-            error: error.message || "Không thể xóa sản phẩm!"
+            error: error.response?.data?.error || error.message || "Không thể xóa sản phẩm!"
         });
 
     } finally {
         if (connection) connection.release();
     }
 });
+
 // =========================================================================
 // ROUTE BẢO MẬT: CHỈ ADMIN MỚI ĐƯỢC TẠO DANH MỤC
 // =========================================================================    
